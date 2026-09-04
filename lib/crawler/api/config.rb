@@ -14,6 +14,8 @@ require_dependency(File.join(__dir__, '..', 'data', 'crawl_result', 'html'))
 require_dependency(File.join(__dir__, '..', 'data', 'extraction', 'ruleset'))
 require_dependency(File.join(__dir__, '..', 'document_mapper'))
 require_dependency(File.join(__dir__, '..', 'utils'))
+require_dependency(File.join(__dir__, '..', 'markdown_converter'))
+require_dependency(File.join(__dir__, '..', '..', 'es', 'bulk_queue'))
 
 java_import java.io.ByteArrayInputStream
 java_import java.security.cert.CertificateFactory
@@ -66,6 +68,9 @@ module Crawler
 
         # Elasticsearch settings
         :elasticsearch, # Elasticsearch connection settings
+
+        # Markdown conversion settings (nested hash, see docs/features/MARKDOWN_CONVERSION.md)
+        :markdown_conversion,
 
         # HTTP header settings
         :http_header_service,  # Service to determine the HTTP headers used for requests made from the crawler.
@@ -138,6 +143,18 @@ module Crawler
 
       EXTRACTION_RULES_FIELDS = %i[url_filters rules].freeze
 
+      MARKDOWN_CONVERSION_FIELDS = %i[enabled base_url wait_seconds poll_interval timeout on_failure ca_file].freeze
+      MARKDOWN_CONVERSION_DEFAULTS = {
+        enabled: false,
+        base_url: nil,
+        wait_seconds: 10,
+        poll_interval: 2,
+        timeout: 900,
+        on_failure: 'text',
+        ca_file: nil
+      }.freeze
+      MARKDOWN_ON_FAILURE_POLICIES = %w[text skip].freeze
+
       # Please note: These defaults are used the `Crawler::HttpUtils::Config` class.
       # Make sure to check those before renaming or removing any defaults.
       DEFAULTS = {
@@ -206,6 +223,7 @@ module Crawler
         crawl_rules: {},
         purge_crawl_enabled: true,
         full_html_extraction_enabled: false,
+        markdown_conversion: MARKDOWN_CONVERSION_DEFAULTS,
 
         # Sink lock retry settings
         sink_lock_retry_interval: 1,
@@ -254,6 +272,7 @@ module Crawler
         configure_sitemap_urls!
         configure_extraction_rules!
         configure_exclude_tags!
+        configure_markdown_conversion!
       end
 
       def to_s
@@ -489,6 +508,92 @@ module Crawler
         end
       end
 
+      # `markdown_conversion:` with no children parses as nil in YAML and means "all defaults"
+      def configure_markdown_conversion!
+        unless markdown_conversion.nil? || markdown_conversion.is_a?(Hash)
+          raise ArgumentError, 'markdown_conversion must be a hash'
+        end
+
+        settings = MARKDOWN_CONVERSION_DEFAULTS.merge((markdown_conversion || {}).symbolize_keys)
+        extra_keys = settings.keys - MARKDOWN_CONVERSION_FIELDS
+        raise ArgumentError, "Unexpected markdown_conversion options: #{extra_keys.inspect}" if extra_keys.any?
+
+        validate_markdown_settings!(settings)
+
+        @markdown_conversion = settings
+      end
+
+      def validate_markdown_settings!(settings)
+        validate_markdown_enabled!(settings)
+        validate_markdown_on_failure!(settings)
+        validate_markdown_wait_seconds!(settings)
+        validate_markdown_durations!(settings)
+        return unless settings[:enabled]
+
+        validate_markdown_base_url!(settings)
+        validate_markdown_body_size!
+      end
+
+      def validate_markdown_enabled!(settings)
+        return if [true, false].include?(settings[:enabled])
+
+        raise ArgumentError, 'markdown_conversion.enabled must be true or false'
+      end
+
+      def validate_markdown_on_failure!(settings)
+        settings[:on_failure] = settings[:on_failure].to_s
+        return if MARKDOWN_ON_FAILURE_POLICIES.include?(settings[:on_failure])
+
+        raise ArgumentError,
+              "markdown_conversion.on_failure must be one of #{MARKDOWN_ON_FAILURE_POLICIES.join(', ')}"
+      end
+
+      def validate_markdown_wait_seconds!(settings)
+        wait = settings[:wait_seconds]
+        return if wait.is_a?(Integer) && wait.between?(0, 60)
+
+        raise ArgumentError, 'markdown_conversion.wait_seconds must be an integer between 0 and 60'
+      end
+
+      def validate_markdown_durations!(settings)
+        %i[poll_interval timeout].each do |key|
+          value = settings[key]
+          next if value.is_a?(Numeric) && value.positive?
+
+          raise ArgumentError, "markdown_conversion.#{key} must be a positive number"
+        end
+      end
+
+      def validate_markdown_base_url!(settings)
+        base_url = settings[:base_url].to_s.strip
+        if base_url.empty?
+          raise ArgumentError, 'markdown_conversion.base_url is required when markdown_conversion.enabled is true'
+        end
+
+        scheme = Addressable::URI.parse(base_url).scheme
+        unless %w[http https].include?(scheme)
+          raise ArgumentError, "markdown_conversion.base_url #{base_url.inspect} must be an http(s) URL"
+        end
+
+        settings[:base_url] = base_url.chomp('/')
+      rescue Addressable::URI::InvalidURIError => e
+        raise ArgumentError, "markdown_conversion.base_url is not a valid URL (#{e.message})"
+      end
+
+      # A markdown body must fit into a single bulk request, otherwise the ES sink can never flush it
+      def validate_markdown_body_size!
+        return unless output_sink.to_s == 'elasticsearch'
+
+        bulk_max = elasticsearch&.dig(:bulk_api, :max_size_bytes) || ES::BulkQueue::DEFAULT_SIZE_THRESHOLD
+        return if max_body_size < bulk_max
+
+        raise ArgumentError, <<~MSG.squish
+          markdown_conversion is enabled but max_body_size (#{max_body_size}) is not smaller than
+          elasticsearch.bulk_api.max_size_bytes (#{bulk_max}); a single markdown document could exceed one
+          bulk request. Lower max_body_size or raise elasticsearch.bulk_api.max_size_bytes.
+        MSG
+      end
+
       def configure_logging!(log_level, event_logs_to_file_enabled, system_logs_to_file_enabled)
         # set up log directory if it doesn't exist
         if event_logs_to_file_enabled || system_logs_to_file_enabled
@@ -548,6 +653,10 @@ module Crawler
 
       def document_mapper
         @document_mapper ||= ::Crawler::DocumentMapper.new(self)
+      end
+
+      def markdown_converter
+        @markdown_converter ||= ::Crawler::MarkdownConverter.new(self)
       end
     end
   end

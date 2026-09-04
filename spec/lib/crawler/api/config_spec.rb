@@ -360,6 +360,164 @@ RSpec.describe(Crawler::API::Config) do
       end
     end
 
+    context 'when configuring markdown conversion' do
+      let(:base_params) { { domains: [{ url: 'https://example.com' }], output_sink: :console } }
+
+      it 'defaults to disabled with the documented defaults' do
+        config = Crawler::API::Config.new(base_params)
+        expect(config.markdown_conversion).to eq(
+          enabled: false,
+          base_url: nil,
+          wait_seconds: 10,
+          poll_interval: 2,
+          timeout: 900,
+          on_failure: 'text',
+          ca_file: nil
+        )
+      end
+
+      it 'treats a nil markdown_conversion block as all defaults' do
+        config = Crawler::API::Config.new(base_params.merge(markdown_conversion: nil))
+        expect(config.markdown_conversion).to include(enabled: false, on_failure: 'text')
+      end
+
+      it 'rejects a non-hash markdown_conversion value' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: 'yes'))
+        end.to raise_error(ArgumentError, 'markdown_conversion must be a hash')
+      end
+
+      it 'rejects an unknown top-level key' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversions: { enabled: true }))
+        end.to raise_error(ArgumentError, /Unexpected configuration options.*markdown_conversions/)
+      end
+
+      it 'rejects unknown nested keys' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { enabled: false, retries: 3 }))
+        end.to raise_error(ArgumentError, /Unexpected markdown_conversion options.*retries/)
+      end
+
+      it 'merges user settings over the defaults and strips a trailing slash from base_url' do
+        config = Crawler::API::Config.new(
+          base_params.merge(markdown_conversion: { enabled: true, base_url: 'http://converter.test/', wait_seconds: 5 })
+        )
+        expect(config.markdown_conversion).to eq(
+          enabled: true,
+          base_url: 'http://converter.test',
+          wait_seconds: 5,
+          poll_interval: 2,
+          timeout: 900,
+          on_failure: 'text',
+          ca_file: nil
+        )
+      end
+
+      it 'requires enabled to be a boolean' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { enabled: 'yes' }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.enabled must be true or false')
+      end
+
+      it 'requires base_url when enabled' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { enabled: true }))
+        end.to raise_error(ArgumentError, /base_url is required when markdown_conversion.enabled is true/)
+      end
+
+      it 'requires an http(s) base_url when enabled' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { enabled: true, base_url: 'ftp://x' }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.base_url "ftp://x" must be an http(s) URL')
+      end
+
+      it 'rejects an unparseable base_url' do
+        params = base_params.merge(markdown_conversion: { enabled: true, base_url: 'http://exa mple' })
+        expect do
+          Crawler::API::Config.new(params)
+        end.to raise_error(ArgumentError, /markdown_conversion.base_url is not a valid URL/)
+      end
+
+      it 'does not require base_url when disabled' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { enabled: false }))
+        end.not_to raise_error
+      end
+
+      it 'validates on_failure' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { on_failure: 'retry' }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.on_failure must be one of text, skip')
+      end
+
+      it 'accepts on_failure as a symbol and normalizes it to a string' do
+        config = Crawler::API::Config.new(base_params.merge(markdown_conversion: { on_failure: :skip }))
+        expect(config.markdown_conversion[:on_failure]).to eq('skip')
+      end
+
+      it 'validates the wait_seconds range' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { wait_seconds: 61 }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.wait_seconds must be an integer between 0 and 60')
+      end
+
+      it 'validates poll_interval and timeout are positive numbers' do
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { poll_interval: 0 }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.poll_interval must be a positive number')
+        expect do
+          Crawler::API::Config.new(base_params.merge(markdown_conversion: { timeout: '900' }))
+        end.to raise_error(ArgumentError, 'markdown_conversion.timeout must be a positive number')
+      end
+
+      context 'with the elasticsearch sink' do
+        let(:es_params) do
+          {
+            domains: [{ url: 'https://example.com' }],
+            output_sink: :elasticsearch,
+            output_index: 'my-index',
+            elasticsearch: { host: 'http://localhost', port: 9200 },
+            markdown_conversion: { enabled: true, base_url: 'http://converter.test' }
+          }
+        end
+
+        it 'rejects a max_body_size that is not smaller than the bulk request size limit (default 1 MB)' do
+          expect do
+            Crawler::API::Config.new(es_params)
+          end.to raise_error(
+            ArgumentError,
+            /max_body_size \(5242880\) is not smaller than elasticsearch.bulk_api.max_size_bytes \(1048576\)/
+          )
+        end
+
+        it 'accepts a smaller max_body_size' do
+          expect { Crawler::API::Config.new(es_params.merge(max_body_size: 500_000)) }.not_to raise_error
+        end
+
+        it 'honours a larger configured bulk_api.max_size_bytes' do
+          params = es_params.merge(
+            elasticsearch: { host: 'http://localhost', port: 9200, bulk_api: { max_size_bytes: 10_000_000 } }
+          )
+          expect { Crawler::API::Config.new(params) }.not_to raise_error
+        end
+
+        it 'does not validate the body size when markdown conversion is disabled' do
+          params = es_params.merge(markdown_conversion: { enabled: false })
+          expect { Crawler::API::Config.new(params) }.not_to raise_error
+        end
+      end
+
+      it 'exposes a memoised markdown converter' do
+        config = Crawler::API::Config.new(base_params)
+        expect(config.markdown_converter).to be_a(Crawler::MarkdownConverter)
+        expect(config.markdown_converter).to equal(config.markdown_converter)
+        expect(config.markdown_converter.enabled?).to be(false)
+        expect(config.markdown_converter.skip_on_failure?).to be(false)
+        expect(config.markdown_converter.stats).to eq(converted: 0, failed: 0)
+      end
+    end
+
     describe '#configure_http_header_service!' do
       context 'when no auth configuration is provided' do
         let(:domains) { [{ url: 'https://example1.com' }, { url: 'https://example2.com' }] }
