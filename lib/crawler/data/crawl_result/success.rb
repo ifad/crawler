@@ -17,6 +17,10 @@ module Crawler
 
         attr_reader :content
 
+        # Markdown produced by Crawler::MarkdownConverter, nil until a conversion succeeds.
+        # Memoised on the result so the SinkLockedError retry loop in the coordinator does not reconvert.
+        attr_accessor :markdown
+
         def initialize(status_code:, content:, **kwargs)
           super(status_code:, **kwargs)
 
