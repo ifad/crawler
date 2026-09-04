@@ -209,6 +209,7 @@
 #  - application/pdf
 #  - application/msword
 #  - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+#  - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 #  - application/vnd.ms-powerpoint
 #  - application/vnd.openxmlformats-officedocument.presentationml.presentation
 #
@@ -265,6 +266,25 @@
 #  bulk_api:
 #    max_items: 10
 #    max_size_bytes: 1_048_576
+
+## ------------------------------- Markdown Conversion -------------------------
+#
+## Convert crawled HTML pages and PDF/DOCX/XLSX/PPTX files to Markdown through the shared
+##   convert-markdown service before indexing. `body` then holds Markdown and `body_format`
+##   is set to `markdown`; documents that cannot be converted fall back to plain text
+##   (`body_format: text`). See docs/features/MARKDOWN_CONVERSION.md for details.
+##   Binary files still need `binary_content_extraction_enabled` and their MIME types listed above.
+#markdown_conversion:
+#  enabled: false
+#  base_url: https://convert-markdown.ifad.org   # required when enabled; http(s) only
+#  wait_seconds: 10        # 0..60, how long the service may hold the upload request before answering
+#  poll_interval: 2        # seconds between status polls; backs off x1.5 up to 5s
+#  timeout: 900            # hard per-document deadline (submit + polling), in seconds
+#  on_failure: text        # text: index the plain-text fallback | skip: do not index the document
+#  ca_file:                # optional PEM bundle used to verify the converter's TLS certificate
+#
+## NOTE: when enabled with the elasticsearch sink, `max_body_size` must be smaller than
+##   `elasticsearch.bulk_api.max_size_bytes` (default 1_048_576), e.g. `max_body_size: 900_000`.
 
 ## The interval in seconds to wait before retrying to acquire the sink lock.
 #sink_lock_retry_interval: 1
