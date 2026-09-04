@@ -286,7 +286,7 @@ RSpec.describe(Crawler::MarkdownConverter) do
       expect(converter.convert!(html_result)).to eq(:failed)
       expect(html_result.markdown).to be_nil
       expect(stub).to have_been_requested.twice
-      # the retry line reads "Markdown conversion for <url> failed (...)", so only the final failure matches
+      # the retry announcement is logged at debug level, so warn only ever carries the final failure
       expect(config.system_logger).to have_received(:warn)
         .with(/Markdown conversion failed for .*HTTP 503 from converter/)
     end
@@ -423,6 +423,91 @@ RSpec.describe(Crawler::MarkdownConverter) do
       end
     end
 
+    describe 'the circuit breaker' do
+      let(:health_url) { "#{base_url}/api/v1/health" }
+      let(:threshold) { described_class::CIRCUIT_BREAKER_THRESHOLD }
+      # A settable monotonic clock so the 60s cooldown can be crossed without sleeping
+      let(:clock) { [0.0] }
+
+      before do
+        allow(converter).to receive(:monotonic_now) { clock.first }
+        allow(config.system_logger).to receive(:error)
+        allow(config.system_logger).to receive(:info)
+      end
+
+      def trip_breaker!
+        stub_request(:post, upload_url).to_return(status: 422, body: 'nope')
+        threshold.times { converter.convert!(html_result) }
+      end
+
+      it 'opens after the threshold and then fails without any HTTP call' do
+        trip_breaker!
+
+        expect(a_request(:post, upload_url)).to have_been_made.times(threshold)
+        expect(config.system_logger).to have_received(:error).with(
+          "Markdown converter circuit breaker opened after #{threshold} consecutive failures; " \
+          'skipping conversions for 60s'
+        ).once
+
+        expect(converter.convert!(html_result)).to eq(:failed)
+        expect(converter.convert!(pdf_result)).to eq(:failed)
+        expect(html_result.markdown).to be_nil
+        expect(pdf_result.markdown).to be_nil
+        expect(a_request(:post, upload_url)).to have_been_made.times(threshold)
+        expect(converter.stats).to eq(converted: 0, failed: threshold + 2)
+      end
+
+      it 're-probes after the cooldown and closes the breaker when the converter is healthy' do
+        trip_breaker!
+        health = stub_request(:get, health_url).to_return(status: 200)
+        stub_request(:post, upload_url).to_return(json_response('done', markdown: '# Back'))
+
+        clock[0] += described_class::CIRCUIT_BREAKER_COOLDOWN + 1
+        expect(converter.convert!(html_result)).to eq(:converted)
+        expect(html_result.markdown).to eq('# Back')
+        expect(health).to have_been_requested.once
+        expect(config.system_logger).to have_received(:info).with(/circuit breaker closed/)
+      end
+
+      it 'stays open and re-arms the cooldown when the probe fails' do
+        trip_breaker!
+        health = stub_request(:get, health_url).to_return(status: 503)
+
+        clock[0] += described_class::CIRCUIT_BREAKER_COOLDOWN + 1
+        expect(converter.convert!(html_result)).to eq(:failed)
+        expect(health).to have_been_requested.twice # the health check itself retries once
+
+        expect(converter.convert!(html_result)).to eq(:failed)
+        expect(health).to have_been_requested.twice # cooldown re-armed, so no new probe
+        expect(a_request(:post, upload_url)).to have_been_made.times(threshold)
+      end
+
+      it 'resets the consecutive failure count after a successful conversion' do
+        stub_request(:post, upload_url).to_return(status: 422, body: 'nope')
+        (threshold - 1).times { converter.convert!(html_result) }
+        stub_request(:post, upload_url).to_return(json_response('done', markdown: '# Ok'))
+        expect(converter.convert!(html_result)).to eq(:converted)
+
+        stub_request(:post, upload_url).to_return(status: 422, body: 'nope')
+        (threshold - 1).times { converter.convert!(html_result) }
+
+        expect(a_request(:post, upload_url)).to have_been_made.times((threshold * 2) - 1)
+        expect(config.system_logger).not_to have_received(:error)
+      end
+
+      context 'when disabled' do
+        let(:markdown_settings) { { enabled: false } }
+
+        it 'never opens' do
+          strict_result = double(:crawl_result)
+
+          (threshold + 5).times { expect(converter.convert!(strict_result)).to eq(:skipped) }
+          expect(converter.stats).to eq(converted: 0, failed: 0)
+          expect(config.system_logger).not_to have_received(:error)
+        end
+      end
+    end
+
     it 'counts conversions and failures across calls' do
       stub_request(:post, upload_url).to_return(
         json_response('done', markdown: '# One'),
@@ -461,7 +546,10 @@ RSpec.describe(Crawler::MarkdownConverter) do
   describe '#healthy?' do
     let(:health_url) { "#{base_url}/api/v1/health" }
 
-    before { allow(config.system_logger).to receive(:warn) }
+    before do
+      allow(config.system_logger).to receive(:warn)
+      allow(converter).to receive(:sleep)
+    end
 
     it 'is true when the health endpoint returns 200 and sends the crawler user agent' do
       stub = stub_request(:get, health_url)
@@ -471,20 +559,29 @@ RSpec.describe(Crawler::MarkdownConverter) do
       expect(stub).to have_been_requested.once
     end
 
-    it 'is false on a non-200 response' do
-      stub_request(:get, health_url).to_return(status: 503)
+    it 'is false after two non-200 responses' do
+      stub = stub_request(:get, health_url).to_return(status: 503)
       expect(converter.healthy?).to be(false)
+      expect(stub).to have_been_requested.twice
+    end
+
+    it 'retries once after a second and succeeds when the second attempt returns 200' do
+      stub = stub_request(:get, health_url).to_return({ status: 503 }, { status: 200 })
+      expect(converter.healthy?).to be(true)
+      expect(stub).to have_been_requested.twice
+      expect(converter).to have_received(:sleep).with(1).once
     end
 
     it 'is false and warns when the service is unreachable' do
       stub_request(:get, health_url).to_raise(Errno::ECONNREFUSED)
       expect(converter.healthy?).to be(false)
-      expect(config.system_logger).to have_received(:warn).with(/health check failed.*ECONNREFUSED/)
+      expect(config.system_logger).to have_received(:warn).with(/health check failed.*ECONNREFUSED/).twice
     end
 
     it 'is false on a timeout' do
-      stub_request(:get, health_url).to_timeout
+      stub = stub_request(:get, health_url).to_timeout
       expect(converter.healthy?).to be(false)
+      expect(stub).to have_been_requested.twice
     end
 
     it 'uses a 5 second timeout' do

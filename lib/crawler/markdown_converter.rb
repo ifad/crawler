@@ -42,6 +42,9 @@ module Crawler
     POLL_BACKOFF = 1.5
     MAX_POLL_INTERVAL = 5
     RETRYABLE_ERRORS = [SystemCallError, SocketError, EOFError, Net::OpenTimeout, Net::ReadTimeout].freeze
+    # Consecutive failures that open the circuit breaker, and how long it stays open before re-probing
+    CIRCUIT_BREAKER_THRESHOLD = 20
+    CIRCUIT_BREAKER_COOLDOWN = 60
 
     attr_reader :config, :settings
 
@@ -52,6 +55,10 @@ module Crawler
       @settings = config.markdown_conversion
       @converted = Concurrent::AtomicFixnum.new(0)
       @failed = Concurrent::AtomicFixnum.new(0)
+      @consecutive_failures = Concurrent::AtomicFixnum.new(0)
+      @circuit_open = false
+      @circuit_retry_at = 0.0
+      @circuit_mutex = Mutex.new
     end
 
     def enabled?
@@ -96,29 +103,29 @@ module Crawler
 
     # Returns :converted | :skipped | :failed and never raises.
     # On success sets crawl_result.markdown (limited to config.max_body_size bytes).
+    # While the circuit breaker is open no HTTP call is made at all: the result is :failed, so
+    # on_failure decides as usual (text -> plain-text body, skip -> document not ingested).
     def convert!(crawl_result)
       return :skipped unless convertible?(crawl_result)
+      return fail_fast_on_open_circuit if circuit_open?
 
       markdown = with_one_retry(crawl_result) { run_conversion(crawl_result) }
       crawl_result.markdown = Crawler::ContentEngine::Utils.limit_bytesize(markdown, config.max_body_size)
       @converted.increment
+      @consecutive_failures.value = 0
       :converted
     rescue StandardError => e
-      @failed.increment
       system_logger.warn("Markdown conversion failed for #{crawl_result.url}: #{e.message}")
-      :failed
+      record_conversion_failure
     end
 
-    # GET /api/v1/health with a short timeout; called once at crawl start
+    # GET /api/v1/health with a short timeout; called at crawl start and when re-probing the circuit
+    # breaker. Retried once after RETRY_DELAY so a single blip does not abort a whole crawl.
     def healthy?
-      uri = URI.parse("#{settings[:base_url]}#{HEALTH_PATH}")
-      request = Net::HTTP::Get.new(uri.request_uri)
-      request['User-Agent'] = config.user_agent
-      response = http_client(uri, open_timeout: HEALTH_TIMEOUT, read_timeout: HEALTH_TIMEOUT).request(request)
-      response.code.to_i == 200
-    rescue StandardError => e
-      system_logger.warn("Markdown converter health check failed (#{settings[:base_url]}): #{e.class}: #{e.message}")
-      false
+      return true if health_check_ok?
+
+      sleep(RETRY_DELAY)
+      health_check_ok?
     end
 
     # Hand-built multipart/form-data body. Everything is appended as ASCII-8BIT so binary payloads
@@ -137,6 +144,82 @@ module Crawler
     end
 
     private
+
+    def health_check_ok?
+      uri = URI.parse("#{settings[:base_url]}#{HEALTH_PATH}")
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request['User-Agent'] = config.user_agent
+      response = http_client(uri, open_timeout: HEALTH_TIMEOUT, read_timeout: HEALTH_TIMEOUT).request(request)
+      response.code.to_i == 200
+    rescue StandardError => e
+      system_logger.warn("Markdown converter health check failed (#{settings[:base_url]}): #{e.class}: #{e.message}")
+      false
+    end
+
+    # Counted like any other failure, but without the per-document warning: the breaker already said it once.
+    def fail_fast_on_open_circuit
+      @failed.increment
+      :failed
+    end
+
+    def record_conversion_failure
+      @failed.increment
+      open_circuit! if @consecutive_failures.increment >= CIRCUIT_BREAKER_THRESHOLD
+      :failed
+    end
+
+    # A converter outage would otherwise cost every document its full retry and timeout budget. After
+    # CIRCUIT_BREAKER_THRESHOLD consecutive failures conversions are short-circuited for
+    # CIRCUIT_BREAKER_COOLDOWN seconds, then a single thread re-probes /health.
+    def circuit_open?
+      return false unless @circuit_open
+      return true if monotonic_now < @circuit_retry_at
+
+      # try_lock: only one thread probes, the others keep short-circuiting instead of queueing behind it
+      with_circuit_lock(default: true) { probe_circuit }
+    end
+
+    def with_circuit_lock(default:)
+      return default unless @circuit_mutex.try_lock
+
+      begin
+        yield
+      ensure
+        @circuit_mutex.unlock
+      end
+    end
+
+    # Returns whether the breaker is still open. Called with the circuit mutex held.
+    def probe_circuit
+      return false unless @circuit_open
+      return true if monotonic_now < @circuit_retry_at
+      return close_circuit! if healthy?
+
+      @circuit_retry_at = monotonic_now + CIRCUIT_BREAKER_COOLDOWN
+      true
+    end
+
+    def close_circuit!
+      @circuit_open = false
+      @consecutive_failures.value = 0
+      system_logger.info('Markdown converter is healthy again, circuit breaker closed')
+      false
+    end
+
+    def open_circuit!
+      with_circuit_lock(default: nil) { open_circuit_now! }
+    end
+
+    def open_circuit_now!
+      return if @circuit_open
+
+      @circuit_retry_at = monotonic_now + CIRCUIT_BREAKER_COOLDOWN
+      @circuit_open = true
+      system_logger.error(
+        "Markdown converter circuit breaker opened after #{@consecutive_failures.value} consecutive failures; " \
+        "skipping conversions for #{CIRCUIT_BREAKER_COOLDOWN}s"
+      )
+    end
 
     def extension_for(crawl_result)
       return HTML_EXTENSION if crawl_result.html?
@@ -169,7 +252,7 @@ module Crawler
       rescue RetryableError => e
         raise e if attempts > 1
 
-        system_logger.warn(
+        system_logger.debug(
           "Markdown conversion for #{crawl_result.url} failed (#{e.message}), retrying once in #{RETRY_DELAY}s"
         )
         sleep(RETRY_DELAY)
