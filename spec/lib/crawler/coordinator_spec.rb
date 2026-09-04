@@ -441,6 +441,113 @@ RSpec.describe(Crawler::Coordinator) do
         process_crawl_result
       end
     end
+
+    context 'when markdown conversion is disabled (default)' do
+      it 'calls the converter but leaves the crawl result untouched and writes it to the sink' do
+        # crawl_result is a strict double: any message outside the ones declared above raises
+        expect(crawl_config.markdown_converter).to receive(:convert!).with(crawl_result).and_call_original
+        expect(crawl.sink).to receive(:write).with(crawl_result).and_call_original
+        process_crawl_result
+      end
+    end
+
+    context 'when markdown conversion is enabled' do
+      let(:on_failure) { 'text' }
+      let(:conversion_result) { :converted }
+      let(:crawl_configuration) do
+        super().merge(
+          output_sink: :mock,
+          markdown_conversion: { enabled: true, base_url: 'http://converter.test', on_failure: }
+        )
+      end
+      let(:converter) { crawl_config.markdown_converter }
+
+      before do
+        allow(converter).to receive(:convert!).and_return(conversion_result)
+      end
+
+      it 'converts the result exactly once before writing it to the sink' do
+        expect(converter).to receive(:convert!).with(crawl_result).once.ordered.and_return(:converted)
+        expect(crawl.sink).to receive(:write).with(crawl_result).ordered.and_call_original
+        process_crawl_result
+      end
+
+      context 'when conversion fails and on_failure is text' do
+        let(:conversion_result) { :failed }
+
+        it 'still writes the result and reports success' do
+          expect(crawl.sink).to receive(:write).with(crawl_result).and_call_original
+          expect(events).to receive(:url_extracted).with(
+            hash_including(url: crawl_result.url, outcome: :success, message: 'Successfully ingested crawl result')
+          )
+          coordinator.send(:process_crawl_result, crawl_task, crawl_result)
+        end
+      end
+
+      context 'when conversion fails and on_failure is skip' do
+        let(:on_failure) { 'skip' }
+        let(:conversion_result) { :failed }
+        let(:skip_message) do
+          "Markdown conversion failed for http://example.com and on_failure is 'skip'; document not ingested"
+        end
+
+        it 'does not write the result and reports a failure outcome' do
+          expect(crawl.sink).not_to receive(:write)
+          expect(system_logger).to receive(:warn).with(skip_message)
+          expect(events).to receive(:url_extracted).with(
+            hash_including(url: crawl_result.url, type: :allowed, outcome: :failure, message: skip_message)
+          )
+          coordinator.send(:process_crawl_result, crawl_task, crawl_result)
+        end
+      end
+
+      context 'when conversion is skipped (unsupported MIME type) and on_failure is skip' do
+        let(:on_failure) { 'skip' }
+        let(:conversion_result) { :skipped }
+
+        it 'writes the result normally' do
+          expect(crawl.sink).to receive(:write).with(crawl_result).and_call_original
+          process_crawl_result
+        end
+      end
+
+      context 'when the crawl result is a redirect' do
+        let(:crawl_result) do
+          double(
+            :crawl_result,
+            url:,
+            redirect_chain: [],
+            location: Crawler::Data::URL.parse('http://example.com/redirected'),
+            error?: false,
+            redirect?: true
+          )
+        end
+
+        it 'does not call the converter' do
+          allow(coordinator).to receive(:add_urls_to_backlog)
+          expect(converter).not_to receive(:convert!)
+          process_crawl_result
+        end
+      end
+
+      context 'when the rule engine denies the result' do
+        let(:rule_engine) do
+          double(
+            :rule_engine,
+            output_crawl_result_outcome: double(
+              :output_crawl_result_outcome, denied?: true, deny_reason: 'blocked', message: 'nope'
+            ),
+            discover_url_outcome: double(:discover_url_outcome, denied?: false)
+          )
+        end
+        let(:crawl_result) { double(:crawl_result, url:, error?: true, redirect?: false) }
+
+        it 'does not call the converter' do
+          expect(converter).not_to receive(:convert!)
+          process_crawl_result
+        end
+      end
+    end
   end
 
   #-------------------------------------------------------------------------------------------------

@@ -9,6 +9,8 @@
 require 'bson'
 require 'concurrent'
 
+require_dependency File.join(__dir__, '..', '..', 'errors')
+
 module Crawler
   module API
     # This represents a crawl job. Individual crawls can be started and then tracked given an
@@ -85,9 +87,13 @@ module Crawler
           url_queue_items: crawl_queue.length,
           seen_urls: seen_urls.count
         )
+        verify_markdown_converter!
         ingestion_stats = coordinator.run_crawl!
 
         record_overall_outcome(coordinator.crawl_results)
+      rescue Errors::MarkdownConverterUnavailableError => e
+        system_logger.error(e.message)
+        record_outcome(outcome: :failure, message: e.message)
       rescue StandardError => e
         log_exception(e, 'Unexpected error while running the crawl')
         record_outcome(
@@ -106,6 +112,7 @@ module Crawler
           crawl_queue.delete
           seen_urls.clear
           print_final_crawl_status
+          log_markdown_conversion_stats
           print_crawl_ingestion_results(ingestion_stats) if config.output_sink.to_s == 'elasticsearch'
         end
       end
@@ -235,6 +242,29 @@ module Crawler
         puts "- Crawl duration (seconds): #{crawl_status[:crawl_duration_msec] / 1000}"
         puts "- Crawling time (seconds): #{crawl_status[:crawling_time_msec] / 1000}"
         puts "- Average response time (seconds): #{crawl_status[:avg_response_time_msec] / 1000}"
+      end
+
+      # Fail fast when the converter is down: a silent outage would degrade the whole index to plain text.
+      # Calling config.markdown_converter here also warms the `@markdown_converter ||=` memo on the main
+      # thread before the task pool starts (the memo is not thread-safe); keep that call unconditional so a
+      # future `return unless enabled?` guard cannot leave the pool threads racing to build separate
+      # instances and splitting the stats across them.
+      def verify_markdown_converter!
+        converter = config.markdown_converter
+        return unless converter.enabled?
+        return if converter.healthy?
+
+        raise Errors::MarkdownConverterUnavailableError, <<~MSG.squish
+          Markdown converter at #{config.markdown_conversion[:base_url]} is not healthy
+          (GET /api/v1/health did not return 200); aborting the crawl so the index is not degraded to plain text
+        MSG
+      end
+
+      def log_markdown_conversion_stats
+        return unless config.markdown_converter.enabled?
+
+        stats = config.markdown_converter.stats
+        system_logger.info("Markdown conversions: converted=#{stats[:converted]} failed=#{stats[:failed]}")
       end
 
       def print_extracted_links(result)
