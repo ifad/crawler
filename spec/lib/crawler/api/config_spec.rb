@@ -557,4 +557,18 @@ RSpec.describe(Crawler::API::Config) do
       end
     end
   end
+
+  describe '#to_s' do
+    it 'redacts sensitive settings, including the markdown converter block' do
+      config = Crawler::API::Config.new(
+        domains: [{ url: 'https://example.com' }],
+        output_sink: :console,
+        markdown_conversion: { enabled: true, base_url: 'https://converter.example.com' }
+      )
+
+      expect(config.to_s).to include('elasticsearch=[redacted]')
+      expect(config.to_s).to include('markdown_conversion=[redacted]')
+      expect(config.to_s).not_to include('converter.example.com')
+    end
+  end
 end

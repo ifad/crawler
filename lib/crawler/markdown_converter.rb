@@ -12,6 +12,9 @@ require 'net/http'
 require 'securerandom'
 require 'uri'
 
+require_dependency File.join(__dir__, 'content_engine', 'transformer')
+require_dependency File.join(__dir__, 'content_engine', 'utils')
+
 module Crawler
   # Converts crawled HTML pages and binary documents (PDF, DOCX, XLSX, PPTX) to Markdown
   # through the shared convert-markdown service. See docs/features/MARKDOWN_CONVERSION.md.
@@ -92,7 +95,9 @@ module Crawler
     # The memoised documents are also used for link extraction, so work on a deep clone.
     def html_payload(crawl_result)
       doc = source_document(crawl_result).clone
-      Crawler::ContentEngine::Transformer.transform!(doc.body)
+      # exclude_tags may have removed the <body> element itself; upload the remaining document as-is
+      body = doc.body
+      Crawler::ContentEngine::Transformer.transform!(body) if body
       doc.charset(java.nio.charset.StandardCharsets::UTF_8)
       String.from_java_bytes(doc.outerHtml.to_java_bytes)
     end
@@ -349,7 +354,10 @@ module Crawler
     # Branch on the JSON status, not the HTTP code (200 and 202 both carry a job document)
     def parse_job(response, polling: false)
       raise_on_http_error!(response, polling)
-      JSON.parse(response.body)
+      job = JSON.parse(response.body)
+      raise ConversionError, 'converter returned a non-object JSON body' unless job.is_a?(Hash)
+
+      job
     rescue JSON::ParserError => e
       raise ConversionError, "invalid JSON from converter: #{e.message}"
     end
@@ -360,7 +368,8 @@ module Crawler
       raise RetryableError, 'HTTP 404 from converter while polling (job expired)' if polling && code == 404
       return if [200, 202].include?(code)
 
-      raise ConversionError, "HTTP #{code} from converter: #{response.body.to_s[0, 200]}"
+      # inspected: the body is remote input and must not be able to forge newlines into the system log
+      raise ConversionError, "HTTP #{code} from converter: #{response.body.to_s[0, 200].inspect}"
     end
 
     def finished?(job)

@@ -237,6 +237,7 @@ module Crawler
         http_proxy_username
         http_proxy_password
         elasticsearch
+        markdown_conversion
       ].freeze
 
       # Specific processed configuration options

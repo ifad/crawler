@@ -130,6 +130,17 @@ RSpec.describe(Crawler::MarkdownConverter) do
         expect(payload).not_to include('secret'.b)
       end
     end
+
+    context 'when the exclusions removed the body element' do
+      let(:exclude_tags) { %w[body] }
+
+      it 'still serialises the document instead of raising' do
+        payload = converter.html_payload(html_result)
+        expect(payload).to be_a(String)
+        expect(payload).to include('<meta charset="UTF-8">'.b)
+        expect(payload).not_to include('Héllo'.b)
+      end
+    end
   end
 
   describe '#binary_payload' do
@@ -381,6 +392,21 @@ RSpec.describe(Crawler::MarkdownConverter) do
 
       expect(converter.convert!(html_result)).to eq(:failed)
       expect(config.system_logger).to have_received(:warn).with(/invalid JSON from converter/)
+    end
+
+    it 'fails when the converter returns a valid JSON body that is not an object' do
+      stub_request(:post, upload_url).to_return(status: 200, body: 'null', headers: json_headers)
+
+      expect(converter.convert!(html_result)).to eq(:failed)
+      expect(html_result.markdown).to be_nil
+      expect(config.system_logger).to have_received(:warn).with(/converter returned a non-object JSON body/)
+    end
+
+    it 'escapes the error body so it cannot forge log lines' do
+      stub_request(:post, upload_url).to_return(status: 400, body: "oops\nWARN: fake log line")
+
+      expect(converter.convert!(html_result)).to eq(:failed)
+      expect(config.system_logger).to have_received(:warn).with(/HTTP 400 from converter: "oops\\nWARN: fake log line"/)
     end
 
     context 'with a small max_body_size' do
