@@ -15,7 +15,7 @@ require 'uri'
 module Crawler
   # Converts crawled HTML pages and binary documents (PDF, DOCX, XLSX, PPTX) to Markdown
   # through the shared convert-markdown service. See docs/features/MARKDOWN_CONVERSION.md.
-  class MarkdownConverter
+  class MarkdownConverter # rubocop:disable Metrics/ClassLength
     # Response Content-Type (charset stripped, downcased) -> upload extension required by the converter.
     # Anything else (incl. legacy application/msword, application/vnd.ms-powerpoint) is not convertible.
     MIME_EXTENSIONS = {
@@ -211,12 +211,26 @@ module Crawler
       end
     end
 
+    # status_url is server-controlled, so it must not be able to move the poll to another service:
+    # only an absolute path is accepted and the parsed URI has to stay on the configured host.
+    # "@evil.host/x" would otherwise parse as host evil.host with base_url as the userinfo.
     def status_uri(job)
-      if job['status_url'].blank?
+      status_url = job['status_url'].to_s
+      if status_url.blank?
         raise ConversionError, "converter returned status #{job['status'].inspect} without a status_url"
       end
 
-      URI.parse("#{settings[:base_url]}#{job['status_url']}")
+      unless status_url.start_with?('/')
+        raise ConversionError, "converter returned a non-absolute status_url: #{status_url.inspect}"
+      end
+
+      URI.parse("#{settings[:base_url]}#{status_url}").tap { |uri| validate_status_host!(uri, status_url) }
+    end
+
+    def validate_status_host!(uri, status_url)
+      return if uri.userinfo.nil? && uri.host == URI.parse(settings[:base_url]).host
+
+      raise ConversionError, "converter returned an off-host status_url: #{status_url.inspect}"
     end
 
     # The deadline runs from the start of the submit and is never retried

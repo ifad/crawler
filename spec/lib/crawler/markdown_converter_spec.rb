@@ -286,8 +286,9 @@ RSpec.describe(Crawler::MarkdownConverter) do
       expect(converter.convert!(html_result)).to eq(:failed)
       expect(html_result.markdown).to be_nil
       expect(stub).to have_been_requested.twice
-      # warned twice: once announcing the retry, once for the final failure
-      expect(config.system_logger).to have_received(:warn).with(/HTTP 503 from converter/).at_least(:once)
+      # the retry line reads "Markdown conversion for <url> failed (...)", so only the final failure matches
+      expect(config.system_logger).to have_received(:warn)
+        .with(/Markdown conversion failed for .*HTTP 503 from converter/)
     end
 
     it 'retries once on a connection error' do
@@ -311,7 +312,7 @@ RSpec.describe(Crawler::MarkdownConverter) do
 
       expect(converter.convert!(html_result)).to eq(:failed)
       expect(stub).to have_been_requested.twice
-      expect(config.system_logger).to have_received(:warn).with(/Net::ReadTimeout/).at_least(:once)
+      expect(config.system_logger).to have_received(:warn).with(/Markdown conversion failed for .*Net::ReadTimeout/)
     end
 
     it 'resubmits once when polling returns HTTP 404 (job expired)' do
@@ -324,6 +325,31 @@ RSpec.describe(Crawler::MarkdownConverter) do
       expect(converter.convert!(html_result)).to eq(:converted)
       expect(html_result.markdown).to eq('# Resubmitted')
       expect(upload).to have_been_requested.twice
+    end
+
+    it 'refuses to poll a status_url that smuggles another host through the userinfo' do
+      upload = stub_request(:post, upload_url)
+               .to_return(status: 202, body: job_json('pending', status_url: '@evil.host/x'), headers: json_headers)
+
+      expect(converter.convert!(html_result)).to eq(:failed)
+      expect(html_result.markdown).to be_nil
+      expect(upload).to have_been_requested.once
+      expect(a_request(:any, %r{//evil.host})).not_to have_been_made
+      expect(config.system_logger).to have_received(:warn).with(/status_url/)
+    end
+
+    it 'refuses to poll an absolute status_url pointing at another host' do
+      upload = stub_request(:post, upload_url).to_return(
+        status: 202,
+        body: job_json('pending', status_url: 'http://evil.host/x'),
+        headers: json_headers
+      )
+
+      expect(converter.convert!(html_result)).to eq(:failed)
+      expect(html_result.markdown).to be_nil
+      expect(upload).to have_been_requested.once
+      expect(a_request(:any, %r{//evil.host})).not_to have_been_made
+      expect(config.system_logger).to have_received(:warn).with(/status_url/)
     end
 
     context 'when the job never finishes' do
@@ -414,13 +440,16 @@ RSpec.describe(Crawler::MarkdownConverter) do
 
       it 'configures the HTTP client with TLS, the CA file and the documented timeouts' do
         clients = []
+        new_args = []
         allow(Net::HTTP).to receive(:new).and_wrap_original do |original, *args|
+          new_args << args
           original.call(*args).tap { |client| clients << client }
         end
         stub_request(:post, upload_url).to_return(json_response('done', markdown: '# TLS'))
 
         expect(converter.convert!(html_result)).to eq(:converted)
         expect(clients.size).to eq(1)
+        expect(new_args.first[2]).to be_nil # p_addr = nil disables Net::HTTP's env proxying
         expect(clients.first.use_ssl?).to be(true)
         expect(clients.first.ca_file).to eq('/etc/ssl/converter-ca.pem')
         expect(clients.first.open_timeout).to eq(10)
