@@ -45,7 +45,7 @@ class FauxCrawl # rubocop:disable Metrics/ClassLength
 
   attr_reader :options, :sites, :site_containers, :timeouts, :content_extraction, :default_encoding, :crawl_id,
               :url_queue, :auth, :user_agent, :url, :seed_urls, :sitemap_urls, :domain_allowlist, :results,
-              :expect_success
+              :expect_success, :markdown_conversion
 
   delegate :crawl, to: :results
 
@@ -62,6 +62,7 @@ class FauxCrawl # rubocop:disable Metrics/ClassLength
     @sitemap_urls = coerce_to_absolute_urls(options[:sitemap_urls] || [])
     @domain_allowlist = seed_urls.map { |url| Crawler::Data::URL.parse(url).site }
     @content_extraction = options.fetch(:content_extraction, { enabled: false, mime_types: [] })
+    @markdown_conversion = options[:markdown_conversion]
     @default_encoding = options[:default_encoding]
     @timeouts = options.fetch(:timeouts, {}).slice(
       :connect_timeout, :socket_timeout, :request_timeout
@@ -173,6 +174,7 @@ class FauxCrawl # rubocop:disable Metrics/ClassLength
     }
     config.merge!(timeouts)
     config[:default_encoding] = default_encoding if default_encoding
+    config[:markdown_conversion] = markdown_conversion if markdown_conversion
 
     # Add crawl rules for Enterprise Search tests
     if enterprise_search?
