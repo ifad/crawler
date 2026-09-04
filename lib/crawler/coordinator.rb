@@ -528,10 +528,11 @@ module Crawler
     # Runs on the crawl-task thread, before the sink, because the Elasticsearch sink holds its queue lock
     # while mapping documents and a slow conversion there would serialise every thread.
     def convert_and_output_crawl_result(crawl_task, crawl_result)
-      crawl_task_progress(crawl_task, 'converting to markdown') if config.markdown_converter.enabled?
-      conversion = config.markdown_converter.convert!(crawl_result)
+      converter = config.markdown_converter
+      crawl_task_progress(crawl_task, 'converting to markdown') if converter.enabled?
+      conversion = converter.convert!(crawl_result)
 
-      if conversion == :failed && config.markdown_converter.skip_on_failure?
+      if conversion == :failed && converter.skip_on_failure?
         message = "Markdown conversion failed for #{crawl_result.url} and on_failure is 'skip'; document not ingested"
         system_logger.warn(message)
         return sink.failure(message)

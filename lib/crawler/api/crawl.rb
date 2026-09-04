@@ -44,6 +44,9 @@ module Crawler
         # When set to +true+, the shutdown process will stop gracefully while preserving
         # the state of the crawl, which should allow us to resume the crawl later as needed.
         @allow_resume = false
+
+        # Set once the crawl got past its pre-flight checks; the final stats are only worth printing then.
+        @crawl_started = false
       end
 
       delegate :system_logger, :events, :stats, to: :config
@@ -83,11 +86,9 @@ module Crawler
 
       # Starts a new crawl described by the given config. The job is started immediately.
       def start! # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
-        events.crawl_start(
-          url_queue_items: crawl_queue.length,
-          seen_urls: seen_urls.count
-        )
+        emit_crawl_start_event
         verify_markdown_converter!
+        @crawl_started = true
         ingestion_stats = coordinator.run_crawl!
 
         record_overall_outcome(coordinator.crawl_results)
@@ -95,11 +96,7 @@ module Crawler
         system_logger.error(e.message)
         record_outcome(outcome: :failure, message: e.message)
       rescue StandardError => e
-        log_exception(e, 'Unexpected error while running the crawl')
-        record_outcome(
-          outcome: :failure,
-          message: 'Unexpected error while running the crawl, check system logs for details'
-        )
+        fail_crawl_on_unexpected_error(e)
       ensure
         # Execute hooks to either save the state or clean up after the crawl.
         # The actual cleanup and persistence implementation depends on specific UrlQueue and SeenUrls classes
@@ -107,6 +104,7 @@ module Crawler
           system_logger.info('Not removing the crawl queue to allow the crawl to resume later')
           crawl_queue.save
           seen_urls.save
+          log_markdown_conversion_stats
         else
           system_logger.info('Releasing resources used by the crawl...')
           crawl_queue.delete
@@ -119,21 +117,19 @@ module Crawler
 
       # Starts a crawl of a single URL, specifically for the UrlTest CLI command
       def start_url_test!(endpoint) # rubocop:disable Metrics/AbcSize
-        events.crawl_start(
-          url_queue_items: crawl_queue.length,
-          seen_urls: seen_urls.count
-        )
+        emit_crawl_start_event
         # Use the File sink regardless of what is set in the config
         @sink = Crawler::OutputSink::File.new(config)
+        verify_markdown_converter!
+        @crawl_started = true
         coordinator.run_urltest_crawl!(endpoint)
         record_overall_outcome(coordinator.crawl_results)
         print_url_test_results(coordinator.url_test_results)
+      rescue Errors::MarkdownConverterUnavailableError => e
+        system_logger.error(e.message)
+        record_outcome(outcome: :failure, message: e.message)
       rescue StandardError => e
-        log_exception(e, 'Unexpected error while running the crawl')
-        record_outcome(
-          outcome: :failure,
-          message: 'Unexpected error while running the crawl, check system logs for details'
-        )
+        fail_crawl_on_unexpected_error(e)
       ensure
         crawl_queue.delete
         seen_urls.clear
@@ -244,6 +240,17 @@ module Crawler
         puts "- Average response time (seconds): #{crawl_status[:avg_response_time_msec] / 1000}"
       end
 
+      def emit_crawl_start_event
+        events.crawl_start(url_queue_items: crawl_queue.length, seen_urls: seen_urls.count)
+      end
+
+      # Both entry points bail out the same way, so the message stays identical for crawl and urltest
+      def fail_crawl_on_unexpected_error(exception)
+        log_exception(exception, 'Unexpected error while running the crawl')
+        message = 'Unexpected error while running the crawl, check system logs for details'
+        record_outcome(outcome: :failure, message:)
+      end
+
       # Fail fast when the converter is down: a silent outage would degrade the whole index to plain text.
       # Calling config.markdown_converter here also warms the `@markdown_converter ||=` memo on the main
       # thread before the task pool starts (the memo is not thread-safe); keep that call unconditional so a
@@ -260,11 +267,14 @@ module Crawler
         MSG
       end
 
+      # Only after the crawl actually started: a crawl aborted by verify_markdown_converter! has nothing
+      # to report. The local is not called `stats` because that name is delegated to the config.
       def log_markdown_conversion_stats
-        return unless config.markdown_converter.enabled?
+        return unless @crawl_started && config.markdown_converter.enabled?
 
-        stats = config.markdown_converter.stats
-        system_logger.info("Markdown conversions: converted=#{stats[:converted]} failed=#{stats[:failed]}")
+        conversion_stats = config.markdown_converter.stats
+        counts = "converted=#{conversion_stats[:converted]} failed=#{conversion_stats[:failed]}"
+        system_logger.info("Markdown conversions: #{counts}")
       end
 
       def print_extracted_links(result)
