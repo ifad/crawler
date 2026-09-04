@@ -226,10 +226,32 @@ module Crawler
       end
 
       def pipeline_params
-        @pipeline_params ||= DEFAULT_PIPELINE_PARAMS.merge(es_config[:pipeline_params] || {})
+        @pipeline_params ||= default_pipeline_params.merge(es_config[:pipeline_params] || {}).tap do |params|
+          warn_about_whitespace_reduction(params)
+        end
       end
 
       private
+
+      def markdown_conversion_enabled?
+        config.markdown_conversion[:enabled] == true
+      end
+
+      # The default ingest pipeline collapses whitespace in `body` (\s+ -> ' '), which destroys markdown
+      def default_pipeline_params
+        return DEFAULT_PIPELINE_PARAMS unless markdown_conversion_enabled?
+
+        DEFAULT_PIPELINE_PARAMS.merge(_reduce_whitespace: false)
+      end
+
+      def warn_about_whitespace_reduction(params)
+        return unless markdown_conversion_enabled? && params[:_reduce_whitespace] == true
+
+        system_logger.warn(
+          'elasticsearch.pipeline_params._reduce_whitespace is true while markdown_conversion is enabled; ' \
+          'the ingest pipeline will collapse whitespace and break markdown formatting in `body`'
+        )
+      end
 
       def assign_default_pipeline(version, build_flavor)
         # any 9.x or serverless project should use the v2 pipeline

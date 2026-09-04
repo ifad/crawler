@@ -357,6 +357,46 @@ RSpec.describe(Crawler::OutputSink::Elasticsearch) do
       end
     end
 
+    context 'when markdown conversion is enabled' do
+      let(:pipeline_params) { {} }
+      let(:config) do
+        Crawler::API::Config.new(
+          domains:,
+          output_sink: 'elasticsearch',
+          output_index: index_name,
+          max_body_size: 500_000,
+          elasticsearch: {
+            host: 'http://localhost',
+            port: 1234,
+            api_key: 'key',
+            pipeline_params:
+          },
+          markdown_conversion: { enabled: true, base_url: 'http://converter.test' }
+        )
+      end
+
+      it 'defaults _reduce_whitespace to false and keeps binary extraction on' do
+        expect(subject.pipeline_params).to eq(
+          _reduce_whitespace: false,
+          _run_ml_inference: true,
+          _extract_binary_content: true
+        )
+        expect(system_logger).not_to have_received(:warn)
+      end
+
+      context 'when _reduce_whitespace is explicitly true' do
+        let(:pipeline_params) { { _reduce_whitespace: true } }
+
+        it 'honours the setting and warns that markdown will be mangled' do
+          expect(subject.pipeline_params[:_reduce_whitespace]).to be(true)
+          expect(system_logger).to have_received(:warn).with(
+            'elasticsearch.pipeline_params._reduce_whitespace is true while markdown_conversion is enabled; ' \
+            'the ingest pipeline will collapse whitespace and break markdown formatting in `body`'
+          ).once
+        end
+      end
+    end
+
     context 'when elasticsearch.pipeline_enabled is false' do
       let(:config) do
         Crawler::API::Config.new(
