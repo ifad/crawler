@@ -7,6 +7,10 @@
 # frozen_string_literal: true
 
 require 'concurrent/atomic/atomic_fixnum'
+require 'json'
+require 'net/http'
+require 'securerandom'
+require 'uri'
 
 module Crawler
   # Converts crawled HTML pages and binary documents (PDF, DOCX, XLSX, PPTX) to Markdown
@@ -22,6 +26,22 @@ module Crawler
       'application/vnd.openxmlformats-officedocument.presentationml.presentation' => '.pptx'
     }.freeze
     HTML_EXTENSION = '.html'
+
+    # Raised internally for errors worth one retry (network, 5xx, expired job); never escapes convert!
+    class RetryableError < StandardError; end
+    # Raised internally for definitive failures (4xx, status: failed, empty markdown, deadline)
+    class ConversionError < StandardError; end
+
+    UPLOAD_PATH = '/api/v1/convert/upload'
+    HEALTH_PATH = '/api/v1/health'
+    FINISHED_STATUSES = %w[done failed].freeze
+    OPEN_TIMEOUT = 10
+    HEALTH_TIMEOUT = 5
+    READ_TIMEOUT_MARGIN = 20 # read_timeout = wait_seconds + this
+    RETRY_DELAY = 1
+    POLL_BACKOFF = 1.5
+    MAX_POLL_INTERVAL = 5
+    RETRYABLE_ERRORS = [SystemCallError, SocketError, EOFError, Net::OpenTimeout, Net::ReadTimeout].freeze
 
     attr_reader :config, :settings
 
@@ -74,6 +94,48 @@ module Crawler
       crawl_result.content.b
     end
 
+    # Returns :converted | :skipped | :failed and never raises.
+    # On success sets crawl_result.markdown (limited to config.max_body_size bytes).
+    def convert!(crawl_result)
+      return :skipped unless convertible?(crawl_result)
+
+      markdown = with_one_retry(crawl_result) { run_conversion(crawl_result) }
+      crawl_result.markdown = Crawler::ContentEngine::Utils.limit_bytesize(markdown, config.max_body_size)
+      @converted.increment
+      :converted
+    rescue StandardError => e
+      @failed.increment
+      system_logger.warn("Markdown conversion failed for #{crawl_result.url}: #{e.message}")
+      :failed
+    end
+
+    # GET /api/v1/health with a short timeout; called once at crawl start
+    def healthy?
+      uri = URI.parse("#{settings[:base_url]}#{HEALTH_PATH}")
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request['User-Agent'] = config.user_agent
+      response = http_client(uri, open_timeout: HEALTH_TIMEOUT, read_timeout: HEALTH_TIMEOUT).request(request)
+      response.code.to_i == 200
+    rescue StandardError => e
+      system_logger.warn("Markdown converter health check failed (#{settings[:base_url]}): #{e.class}: #{e.message}")
+      false
+    end
+
+    # Hand-built multipart/form-data body. Everything is appended as ASCII-8BIT so binary payloads
+    # concatenate without Encoding::CompatibilityError; Net::HTTP sets Content-Length from body.bytesize.
+    def multipart_body(crawl_result)
+      boundary = SecureRandom.hex(16)
+      payload = crawl_result.html? ? html_payload(crawl_result) : binary_payload(crawl_result)
+      part_type = crawl_result.html? ? 'text/html; charset=utf-8' : normalized_content_type(crawl_result)
+      head = [
+        "--#{boundary}\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename=\"#{upload_filename(crawl_result)}\"\r\n",
+        "Content-Type: #{part_type}\r\n\r\n"
+      ].join.b
+      tail = "\r\n--#{boundary}--\r\n".b
+      [head + payload + tail, "multipart/form-data; boundary=#{boundary}"]
+    end
+
     private
 
     def extension_for(crawl_result)
@@ -97,6 +159,119 @@ module Crawler
     def tags_to_exclude(crawl_result)
       exclude_tags = config.exclude_tags || {}
       exclude_tags.fetch(crawl_result.url.site, nil) || exclude_tags.fetch(crawl_result.url.to_s, [])
+    end
+
+    def with_one_retry(crawl_result)
+      attempts = 0
+      begin
+        attempts += 1
+        yield
+      rescue RetryableError => e
+        raise e if attempts > 1
+
+        system_logger.warn(
+          "Markdown conversion for #{crawl_result.url} failed (#{e.message}), retrying once in #{RETRY_DELAY}s"
+        )
+        sleep(RETRY_DELAY)
+        retry
+      end
+    end
+
+    def run_conversion(crawl_result)
+      deadline = monotonic_now + settings[:timeout]
+      job = submit(crawl_result)
+      job = poll_until_finished(job, deadline) unless finished?(job)
+      raise ConversionError, "converter reported status 'failed': #{job['error']}" if job['status'] == 'failed'
+
+      markdown = job['markdown'].to_s
+      raise ConversionError, 'converter returned empty markdown' if markdown.strip.empty?
+
+      markdown
+    end
+
+    def submit(crawl_result)
+      uri = URI.parse("#{settings[:base_url]}#{UPLOAD_PATH}?wait=#{settings[:wait_seconds]}")
+      request = Net::HTTP::Post.new(uri.request_uri)
+      body, content_type = multipart_body(crawl_result)
+      request['Content-Type'] = content_type
+      request.body = body
+      parse_job(perform(uri, request))
+    end
+
+    def poll_until_finished(job, deadline)
+      uri = status_uri(job)
+      interval = settings[:poll_interval].to_f
+      loop do
+        check_deadline!(job, deadline)
+        sleep(interval)
+        job = poll_status(uri)
+        return job if finished?(job)
+
+        interval = [interval * POLL_BACKOFF, MAX_POLL_INTERVAL].min
+      end
+    end
+
+    def status_uri(job)
+      if job['status_url'].blank?
+        raise ConversionError, "converter returned status #{job['status'].inspect} without a status_url"
+      end
+
+      URI.parse("#{settings[:base_url]}#{job['status_url']}")
+    end
+
+    # The deadline runs from the start of the submit and is never retried
+    def check_deadline!(job, deadline)
+      return if monotonic_now < deadline
+
+      raise ConversionError, "timed out after #{settings[:timeout]}s waiting for job #{job['job_id']}"
+    end
+
+    def poll_status(uri)
+      parse_job(perform(uri, Net::HTTP::Get.new(uri.request_uri)), polling: true)
+    end
+
+    def perform(uri, request)
+      request['User-Agent'] = config.user_agent
+      http_client(uri, open_timeout: OPEN_TIMEOUT, read_timeout: settings[:wait_seconds] + READ_TIMEOUT_MARGIN)
+        .request(request)
+    rescue *RETRYABLE_ERRORS => e
+      raise RetryableError, "#{e.class}: #{e.message}"
+    end
+
+    # p_addr = nil disables Net::HTTP's implicit HTTP_PROXY/HTTPS_PROXY env proxying; the crawler's own
+    # http_proxy_* settings only apply to the Java HTTP client used for crawling, not to converter calls.
+    def http_client(uri, open_timeout:, read_timeout:)
+      Net::HTTP.new(uri.host, uri.port, nil).tap do |http|
+        http.use_ssl = uri.scheme == 'https'
+        http.open_timeout = open_timeout
+        http.read_timeout = read_timeout
+        http.ca_file = settings[:ca_file] if settings[:ca_file].present?
+      end
+    end
+
+    # Branch on the JSON status, not the HTTP code (200 and 202 both carry a job document)
+    def parse_job(response, polling: false)
+      raise_on_http_error!(response, polling)
+      JSON.parse(response.body)
+    rescue JSON::ParserError => e
+      raise ConversionError, "invalid JSON from converter: #{e.message}"
+    end
+
+    def raise_on_http_error!(response, polling)
+      code = response.code.to_i
+      raise RetryableError, "HTTP #{code} from converter" if code >= 500
+      raise RetryableError, 'HTTP 404 from converter while polling (job expired)' if polling && code == 404
+      return if [200, 202].include?(code)
+
+      raise ConversionError, "HTTP #{code} from converter: #{response.body.to_s[0, 200]}"
+    end
+
+    def finished?(job)
+      FINISHED_STATUSES.include?(job['status'])
+    end
+
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
   end
 end
