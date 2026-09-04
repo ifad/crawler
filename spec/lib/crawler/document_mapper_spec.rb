@@ -55,6 +55,8 @@ RSpec.describe(Crawler::DocumentMapper) do
           last_crawled_at: crawl_result.start_time.rfc3339,
           title:,
           body: crawl_result.document_body,
+          body_format: 'text',
+          content_hash: Digest::SHA1.hexdigest(content),
           meta_keywords:,
           meta_description:,
           number_value_tag: meta_tag_number,
@@ -74,6 +76,19 @@ RSpec.describe(Crawler::DocumentMapper) do
         result = subject.create_doc(crawl_result)
 
         expect(result).to eq(expected_result)
+      end
+
+      context 'when the crawl result carries markdown' do
+        let(:markdown) { "# A website!\n\nChosen 1\n\n- Chosen 2" }
+        let(:expected_result_markdown) { expected_result.merge(body: markdown, body_format: 'markdown') }
+
+        before { crawl_result.markdown = markdown }
+
+        it 'uses the markdown as the body and marks the format' do
+          result = subject.create_doc(crawl_result)
+
+          expect(result).to eq(expected_result_markdown)
+        end
       end
 
       context 'when extraction rules are present' do
@@ -183,6 +198,8 @@ RSpec.describe(Crawler::DocumentMapper) do
           file_name:,
           content_length:,
           content_type:,
+          content_hash: crawl_result.content_hash,
+          body_format: 'text',
           _attachment: crawl_result.base64_encoded_content,
           url: file_url.to_s,
           url_scheme: file_url.scheme,
@@ -197,6 +214,22 @@ RSpec.describe(Crawler::DocumentMapper) do
         result = subject.create_doc(crawl_result)
 
         expect(result).to eq(expected_result)
+      end
+
+      context 'when the crawl result carries markdown' do
+        let(:markdown) { '# A PDF for ants' }
+        let(:expected_result_markdown) do
+          expected_result.except(:_attachment).merge(body: markdown, body_format: 'markdown')
+        end
+
+        before { crawl_result.markdown = markdown }
+
+        it 'uses the markdown as the body and omits the attachment' do
+          result = subject.create_doc(crawl_result)
+
+          expect(result).to eq(expected_result_markdown)
+          expect(result).not_to have_key(:_attachment)
+        end
       end
 
       context 'when extraction rules are present' do

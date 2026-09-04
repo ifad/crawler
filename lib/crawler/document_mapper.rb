@@ -6,6 +6,8 @@
 
 # frozen_string_literal: true
 
+require 'digest'
+
 module Crawler
   class DocumentMapper
     class UnsupportedCrawlResultError < StandardError; end
@@ -68,7 +70,9 @@ module Crawler
     def html_fields(crawl_result) # rubocop:disable Metrics/AbcSize
       remove_empty_values(
         title: crawl_result.document_title(limit: config.max_title_size),
-        body: crawl_result.document_body(limit: config.max_body_size, exclude_tags: config.exclude_tags),
+        body: html_body(crawl_result),
+        body_format: body_format(crawl_result),
+        content_hash: Digest::SHA1.hexdigest(crawl_result.content.to_s), # content may be nil (response.rb:47)
         meta_keywords: crawl_result.meta_keywords(limit: config.max_keywords_size),
         meta_description: crawl_result.meta_description(limit: config.max_description_size),
         links: crawl_result.links(limit: config.max_indexed_links_count),
@@ -77,13 +81,31 @@ module Crawler
       )
     end
 
+    # With markdown present the ingest attachment processor is not needed, so `_attachment` is omitted
     def binary_file_fields(crawl_result)
-      remove_empty_values(
+      fields = {
         file_name: crawl_result.file_name,
         content_length: crawl_result.content_length,
         content_type: crawl_result.content_type,
-        _attachment: crawl_result.base64_encoded_content
-      )
+        content_hash: crawl_result.content_hash,
+        body_format: body_format(crawl_result)
+      }
+      if crawl_result.markdown
+        fields[:body] = crawl_result.markdown
+      else
+        fields[:_attachment] = crawl_result.base64_encoded_content
+      end
+      remove_empty_values(fields)
+    end
+
+    def html_body(crawl_result)
+      return crawl_result.markdown if crawl_result.markdown
+
+      crawl_result.document_body(limit: config.max_body_size, exclude_tags: config.exclude_tags)
+    end
+
+    def body_format(crawl_result)
+      crawl_result.markdown ? 'markdown' : 'text'
     end
 
     def url_components(url)
