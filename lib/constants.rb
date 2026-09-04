@@ -19,6 +19,8 @@ module Constants
     additional_urls
     body_content
     body
+    body_format
+    content_hash
     domains
     headings
     last_crawled_at

@@ -29,4 +29,8 @@ class Errors
   # against the output_index value, and will continue if the index is found.
   # If it is not found, this error will be raised, which causes a system exit to occur.
   class ExitIfUnableToCreateIndex < SystemExit; end
+
+  # Raised at crawl start when markdown conversion is enabled but the converter's health endpoint
+  # does not answer 200. The crawl aborts instead of silently degrading the whole index to plain text.
+  class MarkdownConverterUnavailableError < StandardError; end
 end

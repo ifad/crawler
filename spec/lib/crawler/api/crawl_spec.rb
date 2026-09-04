@@ -77,6 +77,88 @@ RSpec.describe(Crawler::API::Crawl) do
     expect(subject.sink).to be_a(Crawler::OutputSink::Base)
   end
 
+  it 'does not check converter health when markdown conversion is disabled' do
+    expect(crawl_config.markdown_converter).not_to receive(:healthy?)
+    subject.start!
+  end
+
+  context 'with markdown conversion enabled' do
+    let(:crawl_config) do
+      Crawler::API::Config.new(
+        domains: [{ url: }],
+        output_sink: :mock,
+        results_collection: ResultsCollection.new,
+        markdown_conversion: { enabled: true, base_url: 'http://converter.test' }
+      )
+    end
+    let(:converter) { crawl_config.markdown_converter }
+    let(:system_logger) { crawl_config.system_logger }
+
+    before do
+      allow(converter).to receive(:convert!).and_return(:converted)
+      allow(system_logger).to receive(:info).and_call_original
+      allow(system_logger).to receive(:error).and_call_original
+    end
+
+    context 'when the converter is healthy' do
+      before { allow(converter).to receive(:healthy?).and_return(true) }
+
+      it 'checks health once, runs the crawl and logs the conversion stats' do
+        subject.start!
+
+        expect(converter).to have_received(:healthy?).once
+        expect(subject.outcome).to eq(:success)
+        expect(system_logger).to have_received(:info).with('Markdown conversions: converted=0 failed=0')
+      end
+
+      it 'logs the conversion stats on the resumable shutdown path as well' do
+        allow(subject).to receive(:allow_resume?).and_return(true)
+
+        subject.start!
+
+        expect(system_logger).to have_received(:info).with('Markdown conversions: converted=0 failed=0')
+      end
+
+      it 'checks health before a url test crawl as well' do
+        subject.start_url_test!("#{url}/website")
+
+        expect(converter).to have_received(:healthy?).once
+        expect(subject.outcome).to eq(:success)
+      end
+    end
+
+    context 'when the converter is unhealthy' do
+      before { allow(converter).to receive(:healthy?).and_return(false) }
+
+      it 'aborts the crawl with a clear failure outcome before crawling anything' do
+        expect(subject.coordinator).not_to receive(:run_crawl!)
+
+        subject.start!
+
+        expect(subject.outcome).to eq(:failure)
+        expect(subject.outcome_message).to eq(
+          'Markdown converter at http://converter.test is not healthy (GET /api/v1/health did not return 200); ' \
+          'aborting the crawl so the index is not degraded to plain text'
+        )
+        expect(system_logger).to have_received(:error).with(/is not healthy/)
+        expect(system_logger).not_to have_received(:info).with(/Markdown conversions:/)
+        expect(subject.config.event_logger.mock_events).to include(
+          hash_including('event.action' => 'crawl-end', 'event.outcome' => 'failure')
+        )
+      end
+
+      it 'aborts a url test crawl the same way' do
+        expect(subject.coordinator).not_to receive(:run_urltest_crawl!)
+
+        subject.start_url_test!("#{url}/website")
+
+        expect(subject.outcome).to eq(:failure)
+        expect(subject.outcome_message).to match(/is not healthy/)
+        expect(system_logger).to have_received(:error).with(/is not healthy/)
+      end
+    end
+  end
+
   it 'starts without error' do
     expect { subject.start! }.to_not raise_error
     expect(subject.config.event_logger.mock_events).to include(

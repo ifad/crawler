@@ -14,7 +14,9 @@ module Crawler
       def write(crawl_result)
         puts "# #{crawl_result.id}, #{crawl_result.url}, #{crawl_result.status_code}"
 
-        if crawl_result.content_extractable_file?
+        if crawl_result.respond_to?(:markdown) && crawl_result.markdown
+          puts crawl_result.markdown
+        elsif crawl_result.content_extractable_file?
           puts "** [Content extractable file (content type: #{crawl_result.content_type}, " \
                "content length: #{crawl_result.content.bytesize})] **"
         else

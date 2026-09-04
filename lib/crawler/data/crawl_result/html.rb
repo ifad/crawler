@@ -30,8 +30,8 @@ module Crawler
           # we don't cache per different exclude_tags list because we use
           # the same exclude_tags per CrawlResult, i.e. for every call
           @parsed_content_excluding_tags ||= begin
-            # parsing a fresh copy rather than using parsed_content, as it's a mutable object
-            # and .clone only does a shallow copy
+            # parsing a fresh copy rather than using parsed_content, as it's a mutable object that
+            # callers keep using (Jsoup's .clone is a deep copy, so cloning it would work as well)
             doc = Jsoup.parse(content)
             selector = exclude_tags.join(', ')
             doc.select(selector).remove

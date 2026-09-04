@@ -398,8 +398,7 @@ module Crawler
         crawl_task_progress(crawl_task, 'skipping ingestion of redirect')
         extracted_event[:message] = "Crawler was redirected to #{crawl_result.location}"
       elsif crawl_task.content?
-        crawl_task_progress(crawl_task, 'ingesting the result')
-        outcome = output_crawl_result(crawl_result)
+        outcome = convert_and_output_crawl_result(crawl_task, crawl_result)
         extracted_event.merge!(outcome)
       end
 
@@ -523,6 +522,24 @@ module Crawler
           good_links << link.to_url
         end
       end
+    end
+
+    # Converts the crawl result to markdown (no-op when disabled) and then sends it to the output sink.
+    # Runs on the crawl-task thread, before the sink, because the Elasticsearch sink holds its queue lock
+    # while mapping documents and a slow conversion there would serialise every thread.
+    def convert_and_output_crawl_result(crawl_task, crawl_result)
+      converter = config.markdown_converter
+      crawl_task_progress(crawl_task, 'converting to markdown') if converter.enabled?
+      conversion = converter.convert!(crawl_result)
+
+      if conversion == :failed && converter.skip_on_failure?
+        message = "Markdown conversion failed for #{crawl_result.url} and on_failure is 'skip'; document not ingested"
+        system_logger.warn(message)
+        return sink.failure(message)
+      end
+
+      crawl_task_progress(crawl_task, 'ingesting the result')
+      output_crawl_result(crawl_result)
     end
 
     # Outputs the results of a single URL processing to an output module configured for the crawl
